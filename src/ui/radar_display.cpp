@@ -1,9 +1,11 @@
 #include "ui/radar_display.h"
 
+#include <ESP.h>
 #include <lgfx/v1/lgfx_fonts.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 
 #include "config.h"
@@ -15,7 +17,7 @@
 #include "ui/radar_theme.h"
 #include "ui/runway_overlay.h"
 
-namespace fonts = lgfx::v1::fonts;
+// namespace fonts = lgfx::v1::fonts;  // Already declared in newer LovyanGFX
 
 namespace ui {
 namespace radar {
@@ -378,36 +380,107 @@ void applyTagStyle() {
   }
 }
 
-int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
-  applyTagStyle();
-  int max_w = 0;
-  if (plane.callsign[0] != '\0') {
-    const int w = s_draw->textWidth(plane.callsign);
-    if (w > max_w) {
-      max_w = w;
-    }
+enum class TagLineMode : uint8_t { Callsign = 0, Origin = 1, Dest = 2 };
+enum class TagMetricMode : uint8_t { Altitude = 0, Speed = 1 };
+
+const char* airportLabel(const char* name, const char* iata) {
+  if (name != nullptr && name[0] != '\0') {
+    return name;
   }
-  if (plane.type[0] != '\0') {
-    const int w = s_draw->textWidth(plane.type);
-    if (w > max_w) {
-      max_w = w;
+  if (iata != nullptr && iata[0] != '\0') {
+    return iata;
+  }
+  return nullptr;
+}
+
+bool formatTagLine(const services::adsb::Aircraft& plane, TagLineMode mode,
+                   char* label, size_t label_len) {
+  if (label == nullptr || label_len == 0) {
+    return false;
+  }
+  label[0] = '\0';
+
+  switch (mode) {
+    case TagLineMode::Origin: {
+      const char* text = airportLabel(plane.origin_name, plane.origin);
+      if (text == nullptr) {
+        return false;
+      }
+      snprintf(label, label_len, "^ %s", text);
+      return true;
     }
+    case TagLineMode::Dest: {
+      const char* text = airportLabel(plane.dest_name, plane.dest);
+      if (text == nullptr) {
+        return false;
+      }
+      snprintf(label, label_len, "> %s", text);
+      return true;
+    }
+    case TagLineMode::Callsign:
+    default:
+      if (plane.callsign[0] == '\0') {
+        return false;
+      }
+      snprintf(label, label_len, "%s", plane.callsign);
+      return true;
+  }
+}
+
+bool formatMetricLine(const services::adsb::Aircraft& plane, TagMetricMode mode,
+                      char* label, size_t label_len) {
+  if (label == nullptr || label_len == 0) {
+    return false;
+  }
+  label[0] = '\0';
+
+  if (mode == TagMetricMode::Speed && plane.gs_knots > 0.5f) {
+    snprintf(label, label_len, "%d kt", static_cast<int>(lroundf(plane.gs_knots)));
+    return true;
   }
   if (plane.alt[0] != '\0') {
-    const int w = s_draw->textWidth(plane.alt);
-    if (w > max_w) {
-      max_w = w;
-    }
+    snprintf(label, label_len, "%s", plane.alt);
+    return true;
+  }
+  // Speed requested but unknown — leave blank rather than forcing empty alt.
+  if (mode == TagMetricMode::Speed) {
+    return false;
+  }
+  return false;
+}
+
+int measureTagBlockWidth(const services::adsb::Aircraft& plane, TagLineMode mode,
+                         TagMetricMode metric) {
+  applyTagStyle();
+  int max_w = 0;
+
+  char label[36];
+  if (formatTagLine(plane, mode, label, sizeof(label))) {
+    const int w = s_draw->textWidth(label);
+    if (w > max_w) max_w = w;
+  } else if (plane.callsign[0] != '\0') {
+    const int w = s_draw->textWidth(plane.callsign);
+    if (w > max_w) max_w = w;
+  }
+
+  if (plane.type[0] != '\0') {
+    const int w = s_draw->textWidth(plane.type);
+    if (w > max_w) max_w = w;
+  }
+  if (formatMetricLine(plane, metric, label, sizeof(label))) {
+    const int w = s_draw->textWidth(label);
+    if (w > max_w) max_w = w;
   }
   return max_w;
 }
 
-void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
+void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane,
+                     TagLineMode mode, TagMetricMode metric) {
   initTagLabelMetrics();
   applyTagStyle();
 
   const int line_h = s_draw->fontHeight();
-  const int block_w = measureTagBlockWidth(plane);
+  const int block_w = measureTagBlockWidth(plane, mode, metric);
   const int block_h = line_h * 3;
   int ly = y - block_h / 2;
 
@@ -427,7 +500,15 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   }
   ly = std::max(1, std::min(ly, radar::kSize - block_h - 1));
 
-  if (plane.callsign[0] != '\0') {
+  char label[36];
+  if (formatTagLine(plane, mode, label, sizeof(label))) {
+    const bool airport_mode =
+        mode == TagLineMode::Origin || mode == TagLineMode::Dest;
+    s_draw->setTextColor(airport_mode ? radar::kColorTagAltitude
+                                      : radar::kColorLabel,
+                         radar::kColorBackground);
+    s_draw->drawString(label, anchor_x, ly);
+  } else if (plane.callsign[0] != '\0') {
     s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
     s_draw->drawString(plane.callsign, anchor_x, ly);
   }
@@ -439,9 +520,9 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   }
   ly += line_h;
 
-  if (plane.alt[0] != '\0') {
+  if (formatMetricLine(plane, metric, label, sizeof(label))) {
     s_draw->setTextColor(radar::kColorTagAltitude, radar::kColorBackground);
-    s_draw->drawString(plane.alt, anchor_x, ly);
+    s_draw->drawString(label, anchor_x, ly);
   }
 }
 
@@ -523,6 +604,15 @@ void drawAircraft() {
     ++dot_count;
   }
 
+  // Line 1: callsign -> origin -> destination
+  // Line 3: altitude <-> ground speed
+  static uint8_t s_tag_mode = 0;
+  static uint8_t s_metric_mode = 0;
+  s_tag_mode = static_cast<uint8_t>((s_tag_mode + 1) % 3);
+  s_metric_mode = static_cast<uint8_t>((s_metric_mode + 1) % 2);
+  const TagLineMode mode = static_cast<TagLineMode>(s_tag_mode);
+  const TagMetricMode metric = static_cast<TagMetricMode>(s_metric_mode);
+
   sortBeyondDotsFarFirst(dots, dot_count);
   for (size_t d = 0; d < dot_count; ++d) {
     drawBeyondRingDot(dots[d].x, dots[d].y);
@@ -539,7 +629,7 @@ void drawAircraft() {
   }
   for (size_t d = 0; d < draw_count; ++d) {
     const size_t i = items[d].index;
-    drawAircraftTag(items[d].x, items[d].y, planes[i]);
+    drawAircraftTag(items[d].x, items[d].y, planes[i], mode, metric);
   }
 }
 
@@ -660,9 +750,17 @@ bool ensureFrameSprite() {
   if (s_frame_ready) {
     return true;
   }
-  s_frame.setColorDepth(16);
+  // 8-bit (~56 KB) instead of RGB565 (~112 KB): after HTTPS/WiFi activity the
+  // largest free block is often just under 115200, so 16-bit realloc fails.
+  s_frame.setColorDepth(8);
   if (!s_frame.createSprite(radar::kSize, radar::kSize)) {
-    Serial.println("radar: frame sprite alloc failed");
+    static bool s_logged = false;
+    if (!s_logged) {
+      Serial.printf("radar: frame sprite alloc failed (free=%u maxblk=%u)\n",
+                    static_cast<unsigned>(ESP.getFreeHeap()),
+                    static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      s_logged = true;
+    }
     return false;
   }
   s_frame_ready = true;
@@ -708,7 +806,19 @@ void radarDisplayRefreshAircraft() {
     return;
   }
 
-  radarDisplayDraw();
+  const DrawScope scope(tft);
+  drawStaticGrid(tft);
+  drawAircraft();
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
+void radarDisplaySuspendFrameBuffer() {
+  if (!s_frame_ready) {
+    return;
+  }
+  s_frame.deleteSprite();
+  s_frame_ready = false;
+  s_draw = &tft;
 }
 
 }  // namespace ui
